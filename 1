@@ -1,0 +1,595 @@
+/**
+ * mincraf 1.js
+ * ───────────────────────────────────────────────────────────
+ * Fully customizable Minecraft AI Bot — single file edition.
+ * Includes: bot logic, web control panel, and dashboard server,
+ * all in one file. Edit the CONFIG object below to customize.
+ *
+ * Setup:
+ *   npm install mineflayer mineflayer-pathfinder ws
+ *   node "mincraf 1.js"
+ *   open http://localhost:3000
+ * ───────────────────────────────────────────────────────────
+ */
+
+// ════════════════════════════════════════════════════════════
+//  CONFIG — edit this to customize your bot
+// ════════════════════════════════════════════════════════════
+const CONFIG = {
+  bot: {
+    username: "YourBotName",
+    password: "",
+    auth: "microsoft",          // "microsoft" | "mojang" | "offline"
+    owner: "YourMinecraftUsername",
+    ownerOnly: true,
+    commandPrefix: "!",
+  },
+
+  server: {
+    host: "localhost",
+    port: 25565,
+    version: "1.20.1",          // or false to auto-detect
+  },
+
+  autoReconnect: true,
+  maxReconnectAttempts: 5,
+  reconnectDelay: 5,            // seconds
+
+  dashboard: {
+    port: 3000,
+  },
+
+  behaviors: {
+    greeting: "Hello! I'm online and ready.",
+    deathMessage: "I died... respawning!",
+    lowHealthThreshold: 5,
+    lowHealthMessage: "I'm almost dead, help!",
+    antiAfk: true,
+    antiAfkInterval: 30000,
+    autoLook: false,
+    autoRespond: {
+      "hello": "Hey there!",
+      "bye": "Goodbye!",
+      "how are you": "I'm doing great, thanks for asking!",
+    },
+  },
+};
+
+// ════════════════════════════════════════════════════════════
+//  DEPENDENCIES
+// ════════════════════════════════════════════════════════════
+const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+let bot;
+let reconnectAttempts = 0;
+let statePushInterval;
+const MAX_RECONNECT = CONFIG.autoReconnect ? (CONFIG.maxReconnectAttempts || 5) : 0;
+
+// ════════════════════════════════════════════════════════════
+//  DASHBOARD SERVER (web control panel + WebSocket bridge)
+// ════════════════════════════════════════════════════════════
+let wsClients = new Set();
+
+function startDashboard(port) {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(DASHBOARD_HTML);
+  });
+
+  const wss = new WebSocketServer({ server });
+
+  wss.on('connection', (ws) => {
+    wsClients.add(ws);
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'command') {
+          const result = runCommand(msg.cmd, msg.args || []);
+          ws.send(JSON.stringify({ type: 'log', text: `> ${result}` }));
+        }
+      } catch (e) { /* ignore malformed */ }
+    });
+    ws.on('close', () => wsClients.delete(ws));
+  });
+
+  server.listen(port, () => {
+    console.log(`\n🖥️   Dashboard running at http://localhost:${port}\n`);
+  });
+}
+
+function broadcastState(state) {
+  const payload = JSON.stringify({ type: 'state', state });
+  for (const ws of wsClients) if (ws.readyState === ws.OPEN) ws.send(payload);
+}
+
+function broadcastLog(text, kind = 'info') {
+  const payload = JSON.stringify({ type: 'log', text, kind });
+  for (const ws of wsClients) if (ws.readyState === ws.OPEN) ws.send(payload);
+}
+
+// ════════════════════════════════════════════════════════════
+//  LOGGING + STATE
+// ════════════════════════════════════════════════════════════
+function log(msg) {
+  const ts = new Date().toLocaleTimeString();
+  console.log(`[${ts}] ${msg}`);
+  broadcastLog(`[${ts}] ${msg}`);
+}
+
+function pushState() {
+  if (!bot || !bot.entity) {
+    broadcastState({ connected: false });
+    return;
+  }
+  broadcastState({
+    connected: true,
+    username: bot.username,
+    health: bot.health,
+    food: bot.food,
+    position: bot.entity.position,
+    dimension: bot.game?.dimension,
+    time: bot.time?.timeOfDay,
+    players: Object.keys(bot.players),
+    inventory: bot.inventory.items().map(i => ({ name: i.name, count: i.count })),
+  });
+}
+
+// ════════════════════════════════════════════════════════════
+//  BOT
+// ════════════════════════════════════════════════════════════
+function createBot() {
+  log(`Connecting to ${CONFIG.server.host}:${CONFIG.server.port} as ${CONFIG.bot.username}...`);
+
+  bot = mineflayer.createBot({
+    host:     CONFIG.server.host,
+    port:     CONFIG.server.port,
+    username: CONFIG.bot.username,
+    password: CONFIG.bot.password || undefined,
+    version:  CONFIG.server.version || false,
+    auth:     CONFIG.bot.auth || 'mojang',
+  });
+
+  bot.loadPlugin(pathfinder);
+
+  bot.once('spawn', () => {
+    reconnectAttempts = 0;
+    log(`✅ Spawned in world as ${bot.username}`);
+
+    bot.pathfinder.setMovements(new Movements(bot));
+
+    if (CONFIG.behaviors.greeting) {
+      setTimeout(() => bot.chat(CONFIG.behaviors.greeting), 1500);
+    }
+    if (CONFIG.behaviors.autoLook) startAutoLook();
+    if (CONFIG.behaviors.antiAfk) startAntiAfk();
+
+    pushState();
+    clearInterval(statePushInterval);
+    statePushInterval = setInterval(pushState, 1000);
+  });
+
+  bot.on('chat', (username, message) => {
+    if (username === bot.username) return;
+    log(`[CHAT] ${username}: ${message}`);
+    broadcastLog(`💬 ${username}: ${message}`, 'chat');
+    handleChat(username, message);
+  });
+
+  bot.on('health', () => {
+    pushState();
+    if (bot.health <= CONFIG.behaviors.lowHealthThreshold && CONFIG.behaviors.lowHealthMessage) {
+      bot.chat(CONFIG.behaviors.lowHealthMessage);
+    }
+  });
+
+  bot.on('death', () => {
+    log('💀 Bot died.');
+    pushState();
+    if (CONFIG.behaviors.deathMessage) bot.chat(CONFIG.behaviors.deathMessage);
+  });
+
+  bot.on('kicked', (reason) => {
+    log(`⚠️  Kicked: ${reason}`);
+    clearInterval(statePushInterval);
+    broadcastState({ connected: false });
+    tryReconnect();
+  });
+
+  bot.on('error', (err) => log(`❌ Error: ${err.message}`));
+
+  bot.on('end', () => {
+    log('🔌 Disconnected.');
+    clearInterval(statePushInterval);
+    broadcastState({ connected: false });
+    tryReconnect();
+  });
+
+  let antiAfkInterval;
+  function startAntiAfk() {
+    clearInterval(antiAfkInterval);
+    antiAfkInterval = setInterval(() => {
+      const moves = ['forward', 'back', 'left', 'right'];
+      const dir = moves[Math.floor(Math.random() * moves.length)];
+      bot.setControlState(dir, true);
+      setTimeout(() => bot.setControlState(dir, false), 500);
+      bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, false);
+    }, CONFIG.behaviors.antiAfkInterval || 30000);
+  }
+
+  let autoLookInterval;
+  function startAutoLook() {
+    clearInterval(autoLookInterval);
+    autoLookInterval = setInterval(() => {
+      const players = Object.values(bot.players).filter(p => p.entity && p.username !== bot.username);
+      if (players.length > 0) bot.lookAt(players[0].entity.position.offset(0, 1.6, 0));
+    }, 2000);
+  }
+
+  function handleChat(username, message) {
+    const owner = CONFIG.bot.owner;
+    const isOwner = !owner || username === owner;
+    const prefix = CONFIG.bot.commandPrefix || '!';
+
+    if (!message.startsWith(prefix)) {
+      if (CONFIG.behaviors.autoRespond) {
+        for (const [trigger, response] of Object.entries(CONFIG.behaviors.autoRespond)) {
+          if (message.toLowerCase().includes(trigger.toLowerCase())) {
+            setTimeout(() => bot.chat(response), 500);
+            return;
+          }
+        }
+      }
+      return;
+    }
+
+    const args = message.slice(prefix.length).trim().split(/\s+/);
+    const cmd = args.shift().toLowerCase();
+
+    if (!isOwner && CONFIG.bot.ownerOnly) {
+      bot.chat(`Only ${owner} can command me.`);
+      return;
+    }
+    runCommand(cmd, args, username);
+  }
+}
+
+function runCommand(cmd, args = [], sourceUsername = null) {
+  if (!bot || !bot.entity) return 'Bot is not connected.';
+
+  const say = (msg) => { bot.chat(msg); return msg; };
+
+  switch (cmd) {
+    case 'come':
+    case 'follow': {
+      const targetName = sourceUsername || args[0];
+      const target = targetName ? bot.players[targetName]?.entity : null;
+      if (!target) return say("I can't see that player!");
+      bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+      return say(`Following ${targetName}!`);
+    }
+    case 'stop':
+      bot.pathfinder.stop();
+      bot.clearControlStates();
+      return say('Stopped.');
+    case 'goto': {
+      const [x, y, z] = args.map(Number);
+      if ([x, y, z].some(isNaN)) return 'Usage: goto <x> <y> <z>';
+      bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+      return say(`Heading to ${x} ${y} ${z}…`);
+    }
+    case 'say':
+      return args.length ? say(args.join(' ')) : 'Nothing to say.';
+    case 'pos': {
+      const p = bot.entity.position;
+      return say(`I'm at ${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}`);
+    }
+    case 'health':
+      return say(`❤ Health: ${bot.health}/20  🍗 Food: ${bot.food}/20`);
+    case 'time':
+      return say(`In-game time: ${bot.time.timeOfDay} (day ${bot.time.day})`);
+    case 'inventory': {
+      const items = bot.inventory.items().map(i => `${i.name}×${i.count}`).join(', ') || 'empty';
+      return say(`Inventory: ${items}`);
+    }
+    case 'look': {
+      const [lx, ly, lz] = args.map(Number);
+      if ([lx, ly, lz].some(isNaN)) return 'Usage: look <x> <y> <z>';
+      bot.lookAt({ x: lx, y: ly, z: lz });
+      return `Looking at ${lx} ${ly} ${lz}`;
+    }
+    case 'jump':
+      bot.setControlState('jump', true);
+      setTimeout(() => bot.setControlState('jump', false), 500);
+      return 'Jumped.';
+    case 'sneak':
+      bot.setControlState('sneak', !bot.getControlState('sneak'));
+      return say(`Sneak: ${bot.getControlState('sneak') ? 'on' : 'off'}`);
+    case 'attack': {
+      const targetName = args[0];
+      const entity = targetName
+        ? Object.values(bot.entities).find(e => e.username === targetName || e.name === targetName)
+        : bot.nearestEntity();
+      if (!entity) return say('No target found.');
+      bot.attack(entity);
+      return say(`Attacking ${entity.username || entity.name || 'entity'}!`);
+    }
+    case 'forward':
+    case 'back':
+    case 'left':
+    case 'right':
+      bot.pathfinder.stop();
+      bot.setControlState(cmd, true);
+      setTimeout(() => bot.setControlState(cmd, false), 800);
+      return `Moving ${cmd}.`;
+    case 'drop': {
+      const item = bot.inventory.items()[0];
+      if (!item) return 'Nothing to drop.';
+      bot.tossStack(item).catch(() => {});
+      return say(`Dropped ${item.name}.`);
+    }
+    case 'disconnect':
+      bot.quit();
+      return 'Disconnecting…';
+    case 'help':
+      return say('Commands: come stop goto say pos health inventory attack jump sneak time forward/back/left/right drop');
+    default:
+      return `Unknown command: ${cmd}`;
+  }
+}
+
+function tryReconnect() {
+  if (reconnectAttempts >= MAX_RECONNECT) {
+    if (MAX_RECONNECT > 0) log('Max reconnect attempts reached. Giving up.');
+    return;
+  }
+  reconnectAttempts++;
+  const delay = (CONFIG.reconnectDelay || 5) * 1000;
+  log(`Reconnecting in ${delay / 1000}s… (attempt ${reconnectAttempts}/${MAX_RECONNECT})`);
+  setTimeout(createBot, delay);
+}
+
+// ════════════════════════════════════════════════════════════
+//  EMBEDDED DASHBOARD HTML
+// ════════════════════════════════════════════════════════════
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bot Control — HUD</title>
+<style>
+  :root {
+    --bg:#16140f; --panel:#221f17; --panel-2:#2b271c;
+    --grass:#6cab3a; --grass-dk:#4d7d29; --dirt:#8a5a3c;
+    --redstone:#b8312f; --gold:#e8c34a; --text:#ece6d6; --text-dim:#a39b86;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:'Courier New', monospace; }
+  body { padding:24px; font-size:11px; line-height:1.6; }
+  .wrap { max-width:980px; margin:0 auto; }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:20px; }
+  .icon-block { width:36px; height:36px; background:var(--grass); border:2px solid #000;
+    box-shadow: inset -4px -4px 0 var(--grass-dk), inset 4px 4px 0 #8fd35a; flex-shrink:0; }
+  h1 { font-size:16px; margin:0; letter-spacing:1px; text-shadow:2px 2px 0 #000; }
+  .sub { color:var(--text-dim); font-size:9px; margin-top:4px; }
+  .conn-pill { margin-left:auto; padding:8px 12px; border:2px solid #000; font-size:9px; white-space:nowrap; }
+  .conn-pill.online { background:var(--grass); color:#11290a; }
+  .conn-pill.offline { background:var(--redstone); color:#2a0a09; }
+  .grid { display:grid; grid-template-columns:1.1fr 1.4fr; gap:16px; }
+  @media (max-width:760px){ .grid{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:2px solid #000; box-shadow:inset 0 0 0 2px #3a3526; padding:16px; margin-bottom:16px; }
+  .panel h2 { font-size:10px; margin:0 0 14px; color:var(--gold); text-shadow:1px 1px 0 #000; border-bottom:2px dashed #3a3526; padding-bottom:8px; }
+  .stat-row { display:flex; justify-content:space-between; margin-bottom:10px; font-size:10px; }
+  .stat-row span:first-child { color:var(--text-dim); }
+  .bar-track { width:100%; height:14px; background:#000; border:2px solid #000; margin-top:6px; }
+  .bar-fill { height:100%; transition:width .3s steps(10); }
+  .bar-fill.health { background:var(--redstone); }
+  .bar-fill.food { background:var(--dirt); }
+  .coord { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+  .coord div { background:#000; border:2px solid #3a3526; padding:8px 6px; text-align:center; font-size:12px; color:var(--gold); }
+  .coord div small { display:block; color:var(--text-dim); font-size:7px; margin-bottom:4px; }
+  .btn-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .btn-grid.two { grid-template-columns:repeat(2,1fr); }
+  button.mc-btn { font-family:inherit; font-size:9px; color:var(--text); background:var(--panel-2); border:2px solid #000;
+    box-shadow: inset -2px -2px 0 #000, inset 2px 2px 0 #4a4534; padding:12px 6px; cursor:pointer; text-transform:uppercase; letter-spacing:.5px; }
+  button.mc-btn:hover { background:#3a3526; }
+  button.mc-btn:active { transform:translateY(2px); box-shadow:none; }
+  button.mc-btn.danger { color:#ffb3b0; }
+  button.mc-btn.accent { color:var(--gold); }
+  .dpad { display:grid; grid-template-columns:repeat(3,56px); grid-template-rows:repeat(2,44px); gap:6px; justify-content:center; margin-top:4px; }
+  .dpad button:nth-child(1){ grid-column:2; }
+  .dpad button:nth-child(2){ grid-column:1; grid-row:2; }
+  .dpad button:nth-child(3){ grid-column:2; grid-row:2; }
+  .dpad button:nth-child(4){ grid-column:3; grid-row:2; }
+  .row-inline { display:flex; gap:8px; margin-top:10px; }
+  input.mc-input { font-family:inherit; background:#000; border:2px solid #3a3526; color:var(--text); font-size:10px; padding:8px 6px; width:100%; }
+  input.mc-input:focus { outline:2px solid var(--gold); }
+  .console { background:#000; border:2px solid #3a3526; height:260px; overflow-y:auto; padding:10px; font-size:9.5px; line-height:1.8; }
+  .log-line { margin-bottom:4px; word-break:break-word; }
+  .log-line.chat { color:#8fd35a; }
+  .log-line.info { color:var(--text-dim); }
+  .log-line.cmd { color:var(--gold); }
+  .chat-form { display:flex; gap:8px; margin-top:10px; }
+  .players-list, .inv-list { font-size:9.5px; color:var(--text-dim); }
+  .players-list span, .inv-list span { display:inline-block; background:#000; border:1px solid #3a3526; padding:4px 8px; margin:0 6px 6px 0; color:var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="icon-block"></div>
+    <div>
+      <h1>BOT CONTROL PANEL</h1>
+      <div class="sub" id="botname">awaiting connection…</div>
+    </div>
+    <div class="conn-pill offline" id="connPill">● OFFLINE</div>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>VITALS</h2>
+        <div class="stat-row"><span>HEALTH</span><span id="healthVal">--/20</span></div>
+        <div class="bar-track"><div class="bar-fill health" id="healthBar" style="width:0%"></div></div>
+        <div class="stat-row" style="margin-top:14px;"><span>HUNGER</span><span id="foodVal">--/20</span></div>
+        <div class="bar-track"><div class="bar-fill food" id="foodBar" style="width:0%"></div></div>
+        <div class="coord">
+          <div><small>X</small><span id="coordX">--</span></div>
+          <div><small>Y</small><span id="coordY">--</span></div>
+          <div><small>Z</small><span id="coordZ">--</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>MOVEMENT</h2>
+        <div class="dpad">
+          <button class="mc-btn" data-cmd="forward">▲</button>
+          <button class="mc-btn" data-cmd="left">◀</button>
+          <button class="mc-btn" data-cmd="back">▼</button>
+          <button class="mc-btn" data-cmd="right">▶</button>
+        </div>
+        <div class="btn-grid two" style="margin-top:12px;">
+          <button class="mc-btn" data-cmd="jump">JUMP</button>
+          <button class="mc-btn" data-cmd="sneak">SNEAK</button>
+        </div>
+        <div class="btn-grid two" style="margin-top:8px;">
+          <button class="mc-btn accent" data-cmd="come">COME HERE</button>
+          <button class="mc-btn danger" data-cmd="stop">STOP</button>
+        </div>
+        <div class="row-inline">
+          <input class="mc-input" id="gotoX" placeholder="X" />
+          <input class="mc-input" id="gotoY" placeholder="Y" />
+          <input class="mc-input" id="gotoZ" placeholder="Z" />
+          <button class="mc-btn accent" id="gotoBtn">GO</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>ACTIONS</h2>
+        <div class="btn-grid">
+          <button class="mc-btn" data-cmd="attack">ATTACK</button>
+          <button class="mc-btn" data-cmd="drop">DROP</button>
+          <button class="mc-btn" data-cmd="inventory">INV.</button>
+          <button class="mc-btn" data-cmd="pos">LOCATE</button>
+          <button class="mc-btn" data-cmd="time">TIME</button>
+          <button class="mc-btn danger" data-cmd="disconnect">DISCONNECT</button>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>LIVE FEED</h2>
+        <div class="console" id="console"></div>
+        <div class="chat-form">
+          <input class="mc-input" id="chatInput" placeholder="Say something in chat…" />
+          <button class="mc-btn accent" id="chatBtn">SEND</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>NEARBY PLAYERS</h2>
+        <div class="players-list" id="playersList">none yet</div>
+      </div>
+      <div class="panel">
+        <h2>INVENTORY</h2>
+        <div class="inv-list" id="invList">empty</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const ws = new WebSocket('ws://' + location.host);
+  const consoleEl = document.getElementById('console');
+
+  function addLog(text, kind) {
+    const line = document.createElement('div');
+    line.className = 'log-line ' + (kind || 'info');
+    line.textContent = text;
+    consoleEl.appendChild(line);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  ws.onopen = () => addLog('Connected to dashboard server.', 'info');
+  ws.onclose = () => addLog('Dashboard server connection lost.', 'info');
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'state') updateState(msg.state);
+    if (msg.type === 'log') addLog(msg.text, msg.kind || 'info');
+  };
+
+  function sendCommand(cmd, args) {
+    args = args || [];
+    ws.send(JSON.stringify({ type: 'command', cmd: cmd, args: args }));
+    addLog('$ ' + cmd + (args.length ? ' ' + args.join(' ') : ''), 'cmd');
+  }
+
+  document.querySelectorAll('[data-cmd]').forEach(btn => {
+    btn.addEventListener('click', () => sendCommand(btn.dataset.cmd));
+  });
+
+  document.getElementById('gotoBtn').addEventListener('click', () => {
+    const x = document.getElementById('gotoX').value;
+    const y = document.getElementById('gotoY').value;
+    const z = document.getElementById('gotoZ').value;
+    if (x === '' || y === '' || z === '') return;
+    sendCommand('goto', [x, y, z]);
+  });
+
+  document.getElementById('chatBtn').addEventListener('click', sendChat);
+  document.getElementById('chatInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendChat();
+  });
+  function sendChat() {
+    const input = document.getElementById('chatInput');
+    if (!input.value.trim()) return;
+    sendCommand('say', [input.value.trim()]);
+    input.value = '';
+  }
+
+  function updateState(state) {
+    const pill = document.getElementById('connPill');
+    if (state.connected) {
+      pill.textContent = '● ONLINE';
+      pill.className = 'conn-pill online';
+      document.getElementById('botname').textContent = state.username + ' — ' + (state.dimension || 'overworld');
+
+      const h = Math.max(0, Math.min(20, state.health || 0));
+      const f = Math.max(0, Math.min(20, state.food || 0));
+      document.getElementById('healthVal').textContent = h + '/20';
+      document.getElementById('healthBar').style.width = (h / 20 * 100) + '%';
+      document.getElementById('foodVal').textContent = f + '/20';
+      document.getElementById('foodBar').style.width = (f / 20 * 100) + '%';
+
+      if (state.position) {
+        document.getElementById('coordX').textContent = Math.floor(state.position.x);
+        document.getElementById('coordY').textContent = Math.floor(state.position.y);
+        document.getElementById('coordZ').textContent = Math.floor(state.position.z);
+      }
+
+      const playersList = document.getElementById('playersList');
+      const others = (state.players || []).filter(p => p !== state.username);
+      playersList.innerHTML = others.length ? others.map(p => '<span>' + p + '</span>').join('') : 'none nearby';
+
+      const invList = document.getElementById('invList');
+      invList.innerHTML = (state.inventory && state.inventory.length)
+        ? state.inventory.map(i => '<span>' + i.name + ' ×' + i.count + '</span>').join('')
+        : 'empty';
+
+    } else {
+      pill.textContent = '● OFFLINE';
+      pill.className = 'conn-pill offline';
+      document.getElementById('botname').textContent = 'not connected';
+    }
+  }
+</script>
+</body>
+</html>`;
+
+// ════════════════════════════════════════════════════════════
+//  START
+// ════════════════════════════════════════════════════════════
+startDashboard(CONFIG.dashboard.port);
+createBot();
