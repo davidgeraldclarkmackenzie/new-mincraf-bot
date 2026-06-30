@@ -1,0 +1,827 @@
+/**
+ * mincraf 1.js
+ * ───────────────────────────────────────────────────────────
+ * Customizable Minecraft AI Bot — Multi-Bot Command Center
+ * Controls up to 20 bots from one web dashboard, all in one file.
+ *
+ * Setup:
+ *   npm install mineflayer mineflayer-pathfinder ws
+ *   node "mincraf 1.js"
+ *   open http://localhost:3000
+ *
+ * Customize bots in the BOTS array below. Shared defaults live in
+ * DEFAULTS — anything you don't override per-bot falls back to those.
+ * ───────────────────────────────────────────────────────────
+ */
+
+// ════════════════════════════════════════════════════════════
+//  DEFAULTS — applied to every bot unless overridden below
+// ════════════════════════════════════════════════════════════
+const DEFAULTS = {
+  server: {
+    host: "localhost",
+    port: 25565,
+    version: "1.20.1",          // or false to auto-detect
+  },
+  auth: "offline",               // "microsoft" | "mojang" | "offline"
+  password: "",
+  owner: "YourMinecraftUsername",
+  ownerOnly: true,
+  commandPrefix: "!",
+
+  autoReconnect: true,
+  maxReconnectAttempts: 5,
+  reconnectDelay: 5,             // seconds
+
+  behaviors: {
+    greeting: "Hello! I'm online and ready.",
+    deathMessage: "I died... respawning!",
+    lowHealthThreshold: 5,
+    lowHealthMessage: "I'm almost dead, help!",
+    antiAfk: true,
+    antiAfkInterval: 30000,
+    autoLook: false,
+    autoRespond: {
+      "hello": "Hey there!",
+      "bye": "Goodbye!",
+    },
+  },
+};
+
+// ════════════════════════════════════════════════════════════
+//  BOTS — add up to 20 entries. Each only needs a username;
+//  everything else inherits from DEFAULTS unless overridden.
+// ════════════════════════════════════════════════════════════
+const BOTS = [
+  { username: "Bot01" },
+  { username: "Bot02" },
+  { username: "Bot03" },
+  // { username: "Bot04" },
+  // { username: "Bot05", server: { host: "other.server.net", port: 25565 } },
+  // ...add up to 20 total
+];
+
+const DASHBOARD_PORT = 3000;
+
+// ════════════════════════════════════════════════════════════
+//  DEPENDENCIES
+// ════════════════════════════════════════════════════════════
+const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+
+if (BOTS.length === 0) {
+  console.error('No bots configured. Add at least one entry to the BOTS array.');
+  process.exit(1);
+}
+if (BOTS.length > 20) {
+  console.error('Maximum of 20 bots supported. Trim the BOTS array.');
+  process.exit(1);
+}
+
+function merge(base, override) {
+  const out = { ...base, ...override };
+  for (const key of ['server', 'behaviors']) {
+    out[key] = { ...(base[key] || {}), ...(override[key] || {}) };
+  }
+  out.behaviors.autoRespond = { ...(base.behaviors?.autoRespond || {}), ...(override.behaviors?.autoRespond || {}) };
+  return out;
+}
+
+// Each entry: { id, cfg, bot, reconnectAttempts, statePushInterval, intervals:{} }
+const instances = new Map();
+
+BOTS.forEach((override, idx) => {
+  const id = override.username || `bot${idx + 1}`;
+  const cfg = merge(DEFAULTS, override);
+  instances.set(id, {
+    id,
+    cfg,
+    bot: null,
+    reconnectAttempts: 0,
+    statePushInterval: null,
+    antiAfkInterval: null,
+    autoLookInterval: null,
+  });
+});
+
+// ════════════════════════════════════════════════════════════
+//  DASHBOARD SERVER
+// ════════════════════════════════════════════════════════════
+let wsClients = new Set();
+
+function startDashboard(port) {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(DASHBOARD_HTML);
+  });
+
+  const wss = new WebSocketServer({ server });
+
+  wss.on('connection', (ws) => {
+    wsClients.add(ws);
+
+    // send a full snapshot immediately so a freshly-opened tab is in sync
+    for (const inst of instances.values()) {
+      ws.send(JSON.stringify({ type: 'state', id: inst.id, state: getState(inst) }));
+    }
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === 'command') {
+          if (msg.id === '__all__') {
+            for (const inst of instances.values()) {
+              const result = runCommand(inst, msg.cmd, msg.args || []);
+              broadcastLog(inst.id, `> ${result}`, 'cmd');
+            }
+          } else {
+            const inst = instances.get(msg.id);
+            if (inst) {
+              const result = runCommand(inst, msg.cmd, msg.args || []);
+              broadcastLog(inst.id, `> ${result}`, 'cmd');
+            }
+          }
+        }
+      } catch (e) { /* ignore malformed */ }
+    });
+
+    ws.on('close', () => wsClients.delete(ws));
+  });
+
+  server.listen(port, () => {
+    console.log(`\n🖥️   Command Center running at http://localhost:${port}\n`);
+  });
+}
+
+function broadcastState(id, state) {
+  const payload = JSON.stringify({ type: 'state', id, state });
+  for (const ws of wsClients) if (ws.readyState === ws.OPEN) ws.send(payload);
+}
+
+function broadcastLog(id, text, kind = 'info') {
+  const payload = JSON.stringify({ type: 'log', id, text, kind });
+  for (const ws of wsClients) if (ws.readyState === ws.OPEN) ws.send(payload);
+}
+
+// ════════════════════════════════════════════════════════════
+//  LOGGING + STATE
+// ════════════════════════════════════════════════════════════
+function log(id, msg) {
+  const ts = new Date().toLocaleTimeString();
+  console.log(`[${ts}] [${id}] ${msg}`);
+  broadcastLog(id, `[${ts}] ${msg}`);
+}
+
+function getState(inst) {
+  const bot = inst.bot;
+  if (!bot || !bot.entity) return { connected: false, username: inst.id };
+  return {
+    connected: true,
+    username: bot.username,
+    health: bot.health,
+    food: bot.food,
+    position: bot.entity.position,
+    dimension: bot.game?.dimension,
+    time: bot.time?.timeOfDay,
+    players: Object.keys(bot.players),
+    inventory: bot.inventory.items().map(i => ({ name: i.name, count: i.count })),
+  };
+}
+
+function pushState(inst) {
+  broadcastState(inst.id, getState(inst));
+}
+
+// ════════════════════════════════════════════════════════════
+//  BOT LIFECYCLE
+// ════════════════════════════════════════════════════════════
+function createBot(inst) {
+  const { cfg, id } = inst;
+  log(id, `Connecting to ${cfg.server.host}:${cfg.server.port} as ${id}...`);
+
+  const bot = mineflayer.createBot({
+    host:     cfg.server.host,
+    port:     cfg.server.port,
+    username: id,
+    password: cfg.password || undefined,
+    version:  cfg.server.version || false,
+    auth:     cfg.auth || 'offline',
+  });
+  inst.bot = bot;
+
+  bot.loadPlugin(pathfinder);
+
+  bot.once('spawn', () => {
+    inst.reconnectAttempts = 0;
+    log(id, `✅ Spawned in world`);
+
+    bot.pathfinder.setMovements(new Movements(bot));
+
+    if (cfg.behaviors.greeting) {
+      setTimeout(() => bot.chat(cfg.behaviors.greeting), 1500);
+    }
+    if (cfg.behaviors.autoLook) startAutoLook(inst);
+    if (cfg.behaviors.antiAfk) startAntiAfk(inst);
+
+    pushState(inst);
+    clearInterval(inst.statePushInterval);
+    inst.statePushInterval = setInterval(() => pushState(inst), 1000);
+  });
+
+  bot.on('chat', (username, message) => {
+    if (username === bot.username) return;
+    log(id, `[CHAT] ${username}: ${message}`);
+    broadcastLog(id, `💬 ${username}: ${message}`, 'chat');
+    handleChat(inst, username, message);
+  });
+
+  bot.on('health', () => {
+    pushState(inst);
+    if (bot.health <= cfg.behaviors.lowHealthThreshold && cfg.behaviors.lowHealthMessage) {
+      bot.chat(cfg.behaviors.lowHealthMessage);
+    }
+  });
+
+  bot.on('death', () => {
+    log(id, '💀 Died.');
+    pushState(inst);
+    if (cfg.behaviors.deathMessage) bot.chat(cfg.behaviors.deathMessage);
+  });
+
+  bot.on('kicked', (reason) => {
+    log(id, `⚠️  Kicked: ${reason}`);
+    teardown(inst);
+    tryReconnect(inst);
+  });
+
+  bot.on('error', (err) => log(id, `❌ Error: ${err.message}`));
+
+  bot.on('end', () => {
+    log(id, '🔌 Disconnected.');
+    teardown(inst);
+    tryReconnect(inst);
+  });
+}
+
+function teardown(inst) {
+  clearInterval(inst.statePushInterval);
+  clearInterval(inst.antiAfkInterval);
+  clearInterval(inst.autoLookInterval);
+  broadcastState(inst.id, { connected: false, username: inst.id });
+}
+
+function startAntiAfk(inst) {
+  const { bot, cfg } = inst;
+  clearInterval(inst.antiAfkInterval);
+  inst.antiAfkInterval = setInterval(() => {
+    if (!bot.entity) return;
+    const moves = ['forward', 'back', 'left', 'right'];
+    const dir = moves[Math.floor(Math.random() * moves.length)];
+    bot.setControlState(dir, true);
+    setTimeout(() => bot.setControlState(dir, false), 500);
+    bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, false);
+  }, cfg.behaviors.antiAfkInterval || 30000);
+}
+
+function startAutoLook(inst) {
+  const { bot } = inst;
+  clearInterval(inst.autoLookInterval);
+  inst.autoLookInterval = setInterval(() => {
+    if (!bot.entity) return;
+    const players = Object.values(bot.players).filter(p => p.entity && p.username !== bot.username);
+    if (players.length > 0) bot.lookAt(players[0].entity.position.offset(0, 1.6, 0));
+  }, 2000);
+}
+
+function handleChat(inst, username, message) {
+  const { cfg, bot } = inst;
+  const owner = cfg.owner;
+  const isOwner = !owner || username === owner;
+  const prefix = cfg.commandPrefix || '!';
+
+  if (!message.startsWith(prefix)) {
+    if (cfg.behaviors.autoRespond) {
+      for (const [trigger, response] of Object.entries(cfg.behaviors.autoRespond)) {
+        if (message.toLowerCase().includes(trigger.toLowerCase())) {
+          setTimeout(() => bot.chat(response), 500);
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  const args = message.slice(prefix.length).trim().split(/\s+/);
+  const cmd = args.shift().toLowerCase();
+
+  if (!isOwner && cfg.ownerOnly) {
+    bot.chat(`Only ${owner} can command me.`);
+    return;
+  }
+  runCommand(inst, cmd, args, username);
+}
+
+// ════════════════════════════════════════════════════════════
+//  COMMANDS — shared by in-game chat and the dashboard
+// ════════════════════════════════════════════════════════════
+function runCommand(inst, cmd, args = [], sourceUsername = null) {
+  const bot = inst.bot;
+  if (!bot || !bot.entity) return `${inst.id}: not connected.`;
+
+  const say = (msg) => { bot.chat(msg); return msg; };
+
+  switch (cmd) {
+    case 'come':
+    case 'follow': {
+      const targetName = sourceUsername || args[0];
+      const target = targetName ? bot.players[targetName]?.entity : null;
+      if (!target) return say("I can't see that player!");
+      bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+      return say(`Following ${targetName}!`);
+    }
+    case 'stop':
+      bot.pathfinder.stop();
+      bot.clearControlStates();
+      return say('Stopped.');
+    case 'goto': {
+      const [x, y, z] = args.map(Number);
+      if ([x, y, z].some(isNaN)) return 'Usage: goto <x> <y> <z>';
+      bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+      return say(`Heading to ${x} ${y} ${z}…`);
+    }
+    case 'say':
+      return args.length ? say(args.join(' ')) : 'Nothing to say.';
+    case 'pos': {
+      const p = bot.entity.position;
+      return say(`I'm at ${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}`);
+    }
+    case 'health':
+      return say(`❤ Health: ${bot.health}/20  🍗 Food: ${bot.food}/20`);
+    case 'time':
+      return say(`In-game time: ${bot.time.timeOfDay} (day ${bot.time.day})`);
+    case 'inventory': {
+      const items = bot.inventory.items().map(i => `${i.name}×${i.count}`).join(', ') || 'empty';
+      return say(`Inventory: ${items}`);
+    }
+    case 'look': {
+      const [lx, ly, lz] = args.map(Number);
+      if ([lx, ly, lz].some(isNaN)) return 'Usage: look <x> <y> <z>';
+      bot.lookAt({ x: lx, y: ly, z: lz });
+      return `Looking at ${lx} ${ly} ${lz}`;
+    }
+    case 'jump':
+      bot.setControlState('jump', true);
+      setTimeout(() => bot.setControlState('jump', false), 500);
+      return 'Jumped.';
+    case 'sneak':
+      bot.setControlState('sneak', !bot.getControlState('sneak'));
+      return say(`Sneak: ${bot.getControlState('sneak') ? 'on' : 'off'}`);
+    case 'attack': {
+      const targetName = args[0];
+      const entity = targetName
+        ? Object.values(bot.entities).find(e => e.username === targetName || e.name === targetName)
+        : bot.nearestEntity();
+      if (!entity) return say('No target found.');
+      bot.attack(entity);
+      return say(`Attacking ${entity.username || entity.name || 'entity'}!`);
+    }
+    case 'forward':
+    case 'back':
+    case 'left':
+    case 'right':
+      bot.pathfinder.stop();
+      bot.setControlState(cmd, true);
+      setTimeout(() => bot.setControlState(cmd, false), 800);
+      return `Moving ${cmd}.`;
+    case 'drop': {
+      const item = bot.inventory.items()[0];
+      if (!item) return 'Nothing to drop.';
+      bot.tossStack(item).catch(() => {});
+      return say(`Dropped ${item.name}.`);
+    }
+    case 'disconnect':
+      bot.quit();
+      return 'Disconnecting…';
+    case 'reconnect':
+      inst.reconnectAttempts = 0;
+      bot.quit();
+      setTimeout(() => createBot(inst), 1000);
+      return 'Reconnecting…';
+    case 'help':
+      return say('Commands: come stop goto say pos health inventory attack jump sneak time forward/back/left/right drop');
+    default:
+      return `Unknown command: ${cmd}`;
+  }
+}
+
+function tryReconnect(inst) {
+  const cfg = inst.cfg;
+  const max = cfg.autoReconnect ? (cfg.maxReconnectAttempts || 5) : 0;
+  if (inst.reconnectAttempts >= max) {
+    if (max > 0) log(inst.id, 'Max reconnect attempts reached. Giving up.');
+    return;
+  }
+  inst.reconnectAttempts++;
+  const delay = (cfg.reconnectDelay || 5) * 1000;
+  log(inst.id, `Reconnecting in ${delay / 1000}s… (attempt ${inst.reconnectAttempts}/${max})`);
+  setTimeout(() => createBot(inst), delay);
+}
+
+// ════════════════════════════════════════════════════════════
+//  EMBEDDED DASHBOARD HTML (multi-bot command center)
+// ════════════════════════════════════════════════════════════
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Command Center</title>
+<style>
+  :root {
+    --bg:#100f0c; --bg-grad:#181610;
+    --panel:#1d1a14; --panel-2:#26221a; --panel-3:#302b20;
+    --line:#3a3526; --line-soft:#2a261c;
+    --grass:#6cab3a; --grass-dk:#4d7d29; --grass-lt:#8fd35a;
+    --dirt:#8a5a3c; --redstone:#c23b38; --redstone-dk:#7a2422;
+    --gold:#e8c34a; --diamond:#5fd9d4;
+    --text:#ece6d6; --text-dim:#8d8570; --text-faint:#5a5443;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:'Courier New', monospace; }
+  body {
+    background-image: radial-gradient(circle at 15% 0%, #201c14 0%, var(--bg) 55%);
+    padding:20px; font-size:11px; line-height:1.6; min-height:100vh;
+  }
+  .app { max-width:1320px; margin:0 auto; }
+
+  .topbar { display:flex; align-items:center; gap:14px; margin-bottom:18px; }
+  .icon-block { width:34px; height:34px; background:var(--grass); border:2px solid #000;
+    box-shadow: inset -4px -4px 0 var(--grass-dk), inset 4px 4px 0 var(--grass-lt); flex-shrink:0; }
+  h1 { font-size:15px; margin:0; letter-spacing:1px; text-shadow:2px 2px 0 #000; }
+  .sub { color:var(--text-dim); font-size:9px; margin-top:3px; }
+  .fleet-pill { margin-left:auto; padding:8px 14px; border:2px solid #000; font-size:9px;
+    background:var(--panel-2); display:flex; gap:14px; }
+  .fleet-pill b { color:var(--gold); }
+  .dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:5px; }
+  .dot.on { background:var(--grass-lt); box-shadow:0 0 4px var(--grass-lt); }
+  .dot.off { background:var(--redstone); }
+
+  .layout { display:grid; grid-template-columns:230px 1fr; gap:16px; align-items:start; }
+  @media (max-width:880px){ .layout{ grid-template-columns:1fr; } }
+
+  .roster { background:var(--panel); border:2px solid #000; box-shadow:inset 0 0 0 2px var(--line);
+    padding:10px; max-height:80vh; overflow-y:auto; }
+  .roster h2 { font-size:9px; color:var(--text-dim); margin:2px 6px 8px; letter-spacing:1px; }
+  .bot-row { display:flex; align-items:center; gap:8px; padding:9px 8px; cursor:pointer;
+    border:1px solid transparent; margin-bottom:4px; font-size:9.5px; }
+  .bot-row:hover { background:var(--panel-2); }
+  .bot-row.active { background:var(--panel-3); border-color:var(--line); }
+  .bot-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bot-row .mini-hp { font-size:8px; color:var(--text-faint); }
+  .broadcast-btn { width:100%; margin-top:8px; padding:10px 6px; font-family:inherit; font-size:8.5px;
+    background:var(--panel-3); color:var(--gold); border:2px solid #000;
+    box-shadow: inset -2px -2px 0 #000, inset 2px 2px 0 #4a4534; cursor:pointer; letter-spacing:.5px; }
+  .broadcast-btn:hover { background:#3a3526; }
+  .broadcast-btn.active-mode { background:var(--gold); color:#2a2210; }
+
+  .panel { background:var(--panel); border:2px solid #000; box-shadow:inset 0 0 0 2px var(--line);
+    padding:16px; margin-bottom:16px; }
+  .panel h2 { font-size:10px; margin:0 0 14px; color:var(--gold); text-shadow:1px 1px 0 #000;
+    border-bottom:2px dashed var(--line); padding-bottom:8px; }
+  .panel h2 .scope { color:var(--diamond); font-weight:normal; }
+
+  .grid2 { display:grid; grid-template-columns:1.1fr 1.4fr; gap:16px; }
+  @media (max-width:760px){ .grid2{ grid-template-columns:1fr; } }
+
+  .stat-row { display:flex; justify-content:space-between; margin-bottom:10px; font-size:10px; }
+  .stat-row span:first-child { color:var(--text-dim); }
+  .bar-track { width:100%; height:14px; background:#000; border:2px solid #000; margin-top:6px; }
+  .bar-fill { height:100%; transition:width .3s steps(10); }
+  .bar-fill.health { background:var(--redstone); }
+  .bar-fill.food { background:var(--dirt); }
+  .coord { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
+  .coord div { background:#000; border:2px solid var(--line); padding:8px 6px; text-align:center; font-size:12px; color:var(--gold); }
+  .coord div small { display:block; color:var(--text-dim); font-size:7px; margin-bottom:4px; }
+
+  .btn-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .btn-grid.two { grid-template-columns:repeat(2,1fr); }
+  button.mc-btn { font-family:inherit; font-size:9px; color:var(--text); background:var(--panel-2); border:2px solid #000;
+    box-shadow: inset -2px -2px 0 #000, inset 2px 2px 0 #4a4534; padding:12px 6px; cursor:pointer;
+    text-transform:uppercase; letter-spacing:.5px; }
+  button.mc-btn:hover { background:#3a3526; }
+  button.mc-btn:active { transform:translateY(2px); box-shadow:none; }
+  button.mc-btn.danger { color:#ffb3b0; }
+  button.mc-btn.accent { color:var(--gold); }
+  button.mc-btn:disabled { opacity:.35; cursor:not-allowed; }
+
+  .dpad { display:grid; grid-template-columns:repeat(3,1fr); grid-template-rows:repeat(2,44px); gap:6px; margin-top:4px; }
+  .dpad button:nth-child(1){ grid-column:2; }
+  .dpad button:nth-child(2){ grid-column:1; grid-row:2; }
+  .dpad button:nth-child(3){ grid-column:2; grid-row:2; }
+  .dpad button:nth-child(4){ grid-column:3; grid-row:2; }
+
+  .row-inline { display:flex; gap:8px; margin-top:10px; }
+  input.mc-input { font-family:inherit; background:#000; border:2px solid var(--line); color:var(--text);
+    font-size:10px; padding:8px 6px; width:100%; }
+  input.mc-input:focus { outline:2px solid var(--gold); }
+
+  .console { background:#000; border:2px solid var(--line); height:230px; overflow-y:auto; padding:10px;
+    font-size:9.5px; line-height:1.8; }
+  .console::-webkit-scrollbar { width:8px; }
+  .console::-webkit-scrollbar-thumb { background:var(--line); }
+  .log-line { margin-bottom:4px; word-break:break-word; }
+  .log-line .src { color:var(--diamond); }
+  .log-line.chat { color:var(--grass-lt); }
+  .log-line.info { color:var(--text-dim); }
+  .log-line.cmd { color:var(--gold); }
+  .chat-form { display:flex; gap:8px; margin-top:10px; }
+
+  .players-list, .inv-list { font-size:9.5px; color:var(--text-dim); }
+  .players-list span, .inv-list span { display:inline-block; background:#000; border:1px solid var(--line);
+    padding:4px 8px; margin:0 6px 6px 0; color:var(--text); }
+
+  .empty-state { color:var(--text-faint); font-size:10px; text-align:center; padding:40px 10px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="topbar">
+    <div class="icon-block"></div>
+    <div>
+      <h1>COMMAND CENTER</h1>
+      <div class="sub" id="fleetSub">connecting…</div>
+    </div>
+    <div class="fleet-pill">
+      <span><span class="dot on"></span><b id="onlineCount">0</b> online</span>
+      <span><span class="dot off"></span><b id="offlineCount">0</b> offline</span>
+    </div>
+  </div>
+
+  <div class="layout">
+
+    <div class="roster">
+      <h2>FLEET (<span id="fleetTotal">0</span>)</h2>
+      <div id="rosterList"></div>
+      <button class="broadcast-btn" id="broadcastToggle">📡 BROADCAST MODE: OFF</button>
+    </div>
+
+    <div id="mainArea">
+      <div class="panel"><div class="empty-state">Select a bot from the fleet list, or enable broadcast mode to control all bots at once.</div></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  const ws = new WebSocket('ws://' + location.host);
+  const botStates = {};
+  const botLogs = {};
+  let selectedId = null;
+  let broadcastMode = false;
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'state') {
+      botStates[msg.id] = msg.state;
+      renderRoster();
+      if (msg.id === selectedId) renderMain();
+      updateFleetSummary();
+    }
+    if (msg.type === 'log') {
+      if (!botLogs[msg.id]) botLogs[msg.id] = [];
+      botLogs[msg.id].push({ text: msg.text, kind: msg.kind || 'info' });
+      if (botLogs[msg.id].length > 300) botLogs[msg.id].shift();
+      if (msg.id === selectedId || broadcastMode) appendLogLine(msg.id, msg.text, msg.kind);
+    }
+  };
+
+  function sendCommand(targetId, cmd, args) {
+    args = args || [];
+    ws.send(JSON.stringify({ type: 'command', id: targetId, cmd: cmd, args: args }));
+  }
+
+  function updateFleetSummary() {
+    const ids = Object.keys(botStates);
+    const online = ids.filter(id => botStates[id].connected).length;
+    document.getElementById('fleetTotal').textContent = ids.length;
+    document.getElementById('onlineCount').textContent = online;
+    document.getElementById('offlineCount').textContent = ids.length - online;
+    document.getElementById('fleetSub').textContent = ids.length + ' bot' + (ids.length === 1 ? '' : 's') + ' configured';
+  }
+
+  function renderRoster() {
+    const list = document.getElementById('rosterList');
+    const ids = Object.keys(botStates).sort();
+    list.innerHTML = ids.map(id => {
+      const s = botStates[id];
+      const cls = 'bot-row' + (id === selectedId && !broadcastMode ? ' active' : '');
+      const dotCls = s.connected ? 'dot on' : 'dot off';
+      const hp = s.connected ? ('❤' + Math.floor(s.health || 0)) : 'offline';
+      return '<div class="' + cls + '" onclick="selectBot(&quot;' + id + '&quot;)">' +
+        '<span class="' + dotCls + '"></span>' +
+        '<span class="name">' + id + '</span>' +
+        '<span class="mini-hp">' + hp + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function selectBot(id) {
+    selectedId = id;
+    broadcastMode = false;
+    document.getElementById('broadcastToggle').textContent = '📡 BROADCAST MODE: OFF';
+    document.getElementById('broadcastToggle').classList.remove('active-mode');
+    renderRoster();
+    renderMain();
+  }
+
+  document.getElementById('broadcastToggle').addEventListener('click', () => {
+    broadcastMode = !broadcastMode;
+    const btn = document.getElementById('broadcastToggle');
+    btn.textContent = '📡 BROADCAST MODE: ' + (broadcastMode ? 'ON (ALL BOTS)' : 'OFF');
+    btn.classList.toggle('active-mode', broadcastMode);
+    renderRoster();
+    renderMain();
+  });
+
+  function appendLogLine(id, text, kind) {
+    const consoleEl = document.getElementById('console');
+    if (!consoleEl) return;
+    const line = document.createElement('div');
+    line.className = 'log-line ' + (kind || 'info');
+    line.innerHTML = (broadcastMode ? '<span class="src">[' + id + ']</span> ' : '') + escapeHtml(text);
+    consoleEl.appendChild(line);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function renderMain() {
+    const mainArea = document.getElementById('mainArea');
+
+    if (broadcastMode) {
+      mainArea.innerHTML = mainTemplate('ALL BOTS', true);
+      wireButtons('__all__');
+      const ids = Object.keys(botLogs).sort();
+      ids.forEach(id => (botLogs[id] || []).slice(-20).forEach(l => appendLogLine(id, l.text, l.kind)));
+      return;
+    }
+
+    if (!selectedId || !botStates[selectedId]) {
+      mainArea.innerHTML = '<div class="panel"><div class="empty-state">Select a bot from the fleet list, or enable broadcast mode to control all bots at once.</div></div>';
+      return;
+    }
+
+    const s = botStates[selectedId];
+    mainArea.innerHTML = mainTemplate(selectedId, false);
+    wireButtons(selectedId);
+    (botLogs[selectedId] || []).slice(-50).forEach(l => appendLogLine(selectedId, l.text, l.kind));
+    if (s.connected) updateVitals(s);
+  }
+
+  function mainTemplate(label, isBroadcast) {
+    var vitalsBlock = isBroadcast ? '' :
+      '<div class="panel">' +
+        '<h2>VITALS <span class="scope">— ' + label + '</span></h2>' +
+        '<div class="stat-row"><span>HEALTH</span><span id="healthVal">--/20</span></div>' +
+        '<div class="bar-track"><div class="bar-fill health" id="healthBar" style="width:0%"></div></div>' +
+        '<div class="stat-row" style="margin-top:14px;"><span>HUNGER</span><span id="foodVal">--/20</span></div>' +
+        '<div class="bar-track"><div class="bar-fill food" id="foodBar" style="width:0%"></div></div>' +
+        '<div class="coord">' +
+          '<div><small>X</small><span id="coordX">--</span></div>' +
+          '<div><small>Y</small><span id="coordY">--</span></div>' +
+          '<div><small>Z</small><span id="coordZ">--</span></div>' +
+        '</div>' +
+      '</div>';
+
+    var sideExtras = isBroadcast ? '' :
+      '<div class="panel"><h2>NEARBY PLAYERS</h2><div class="players-list" id="playersList">none yet</div></div>' +
+      '<div class="panel"><h2>INVENTORY</h2><div class="inv-list" id="invList">empty</div></div>';
+
+    return '' +
+    '<div class="grid2">' +
+      '<div>' +
+        vitalsBlock +
+        '<div class="panel">' +
+          '<h2>MOVEMENT <span class="scope">— ' + label + '</span></h2>' +
+          '<div class="dpad">' +
+            '<button class="mc-btn" data-cmd="forward">▲</button>' +
+            '<button class="mc-btn" data-cmd="left">◀</button>' +
+            '<button class="mc-btn" data-cmd="back">▼</button>' +
+            '<button class="mc-btn" data-cmd="right">▶</button>' +
+          '</div>' +
+          '<div class="btn-grid two" style="margin-top:12px;">' +
+            '<button class="mc-btn" data-cmd="jump">JUMP</button>' +
+            '<button class="mc-btn" data-cmd="sneak">SNEAK</button>' +
+          '</div>' +
+          '<div class="btn-grid two" style="margin-top:8px;">' +
+            '<button class="mc-btn accent" data-cmd="come">COME HERE</button>' +
+            '<button class="mc-btn danger" data-cmd="stop">STOP</button>' +
+          '</div>' +
+          '<div class="row-inline">' +
+            '<input class="mc-input" id="gotoX" placeholder="X" />' +
+            '<input class="mc-input" id="gotoY" placeholder="Y" />' +
+            '<input class="mc-input" id="gotoZ" placeholder="Z" />' +
+            '<button class="mc-btn accent" id="gotoBtn">GO</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="panel">' +
+          '<h2>ACTIONS <span class="scope">— ' + label + '</span></h2>' +
+          '<div class="btn-grid">' +
+            '<button class="mc-btn" data-cmd="attack">ATTACK</button>' +
+            '<button class="mc-btn" data-cmd="drop">DROP</button>' +
+            '<button class="mc-btn" data-cmd="inventory">INV.</button>' +
+            '<button class="mc-btn" data-cmd="pos">LOCATE</button>' +
+            '<button class="mc-btn" data-cmd="time">TIME</button>' +
+            '<button class="mc-btn" data-cmd="reconnect">RECONNECT</button>' +
+          '</div>' +
+          '<div class="btn-grid two" style="margin-top:8px;">' +
+            '<button class="mc-btn danger" data-cmd="disconnect">DISCONNECT</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div>' +
+        '<div class="panel">' +
+          '<h2>LIVE FEED <span class="scope">— ' + label + '</span></h2>' +
+          '<div class="console" id="console"></div>' +
+          '<div class="chat-form">' +
+            '<input class="mc-input" id="chatInput" placeholder="Say something in chat…" />' +
+            '<button class="mc-btn accent" id="chatBtn">SEND</button>' +
+          '</div>' +
+        '</div>' +
+        sideExtras +
+      '</div>' +
+    '</div>';
+  }
+
+  function wireButtons(targetId) {
+    document.querySelectorAll('[data-cmd]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        sendCommand(targetId, btn.dataset.cmd);
+        appendLogLine(targetId, '$ ' + btn.dataset.cmd, 'cmd');
+      });
+    });
+
+    var gotoBtn = document.getElementById('gotoBtn');
+    if (gotoBtn) gotoBtn.addEventListener('click', () => {
+      var x = document.getElementById('gotoX').value;
+      var y = document.getElementById('gotoY').value;
+      var z = document.getElementById('gotoZ').value;
+      if (x === '' || y === '' || z === '') return;
+      sendCommand(targetId, 'goto', [x, y, z]);
+      appendLogLine(targetId, '$ goto ' + x + ' ' + y + ' ' + z, 'cmd');
+    });
+
+    var chatBtn = document.getElementById('chatBtn');
+    var chatInput = document.getElementById('chatInput');
+    function sendChat() {
+      if (!chatInput.value.trim()) return;
+      sendCommand(targetId, 'say', [chatInput.value.trim()]);
+      appendLogLine(targetId, '$ say ' + chatInput.value.trim(), 'cmd');
+      chatInput.value = '';
+    }
+    if (chatBtn) chatBtn.addEventListener('click', sendChat);
+    if (chatInput) chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+  }
+
+  function updateVitals(s) {
+    var h = Math.max(0, Math.min(20, s.health || 0));
+    var f = Math.max(0, Math.min(20, s.food || 0));
+    var healthVal = document.getElementById('healthVal');
+    if (!healthVal) return;
+    healthVal.textContent = h + '/20';
+    document.getElementById('healthBar').style.width = (h / 20 * 100) + '%';
+    document.getElementById('foodVal').textContent = f + '/20';
+    document.getElementById('foodBar').style.width = (f / 20 * 100) + '%';
+    if (s.position) {
+      document.getElementById('coordX').textContent = Math.floor(s.position.x);
+      document.getElementById('coordY').textContent = Math.floor(s.position.y);
+      document.getElementById('coordZ').textContent = Math.floor(s.position.z);
+    }
+    var playersList = document.getElementById('playersList');
+    if (playersList) {
+      var others = (s.players || []).filter(function(p) { return p !== s.username; });
+      playersList.innerHTML = others.length ? others.map(function(p) { return '<span>' + p + '</span>'; }).join('') : 'none nearby';
+    }
+    var invList = document.getElementById('invList');
+    if (invList) {
+      invList.innerHTML = (s.inventory && s.inventory.length)
+        ? s.inventory.map(function(i) { return '<span>' + i.name + ' ×' + i.count + '</span>'; }).join('')
+        : 'empty';
+    }
+  }
+</script>
+</body>
+</html>`;
+
+// ════════════════════════════════════════════════════════════
+//  START
+// ════════════════════════════════════════════════════════════
+startDashboard(DASHBOARD_PORT);
+for (const inst of instances.values()) {
+  createBot(inst);
+}
